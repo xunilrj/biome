@@ -2,16 +2,35 @@
 
 use biome_js_syntax::binding_ext::{AnyJsBindingDeclaration, AnyJsIdentifierBinding};
 use biome_js_syntax::{
-    AnyJsExportNamedSpecifier, AnyJsImportClause, AnyJsNamedImportSpecifier, AnyTsType,
+    AnyJsExportNamedSpecifier, AnyJsImportClause, AnyJsNamedImportSpecifier, AnyTsType, JsBinaryExpression, JsParenthesizedExpression, JsReturnStatement, JsArrowFunctionExpression, AnyJsFunctionBody, JsFormalParameter,
 };
 use biome_js_syntax::{
     AnyJsIdentifierUsage, JsLanguage, JsSyntaxKind, JsSyntaxNode, TextRange, TsTypeParameterName,
 };
+use biome_rowan::SyntaxNodeCast;
 use biome_rowan::{syntax::Preorder, AstNode, SyntaxNodeOptionExt, TokenText};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
 use std::mem;
 use JsSyntaxKind::*;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SemanticEventType {
+    Unknown,
+    Void,
+    Number,
+    Reference {
+        binding: TextRange,
+    },
+    Binary {
+        left: TextRange,
+        right: TextRange,
+    },
+    Callable {
+        arguments: Vec<TextRange>,
+        returns: Vec<TextRange>
+    }
+}
 
 /// Events emitted by the [SemanticEventExtractor].
 /// These events are later made into the Semantic Model.
@@ -96,6 +115,8 @@ pub enum SemanticEvent {
     /// Tracks where a symbol is exported.
     /// The range points to the binding that is being exported.
     Exported { range: TextRange },
+
+    Type { range: TextRange, t: SemanticEventType }
 }
 
 impl SemanticEvent {
@@ -109,7 +130,8 @@ impl SemanticEvent {
             | Self::Write { range, .. }
             | Self::HoistedWrite { range, .. }
             | Self::UnresolvedReference { range, .. }
-            | Self::Exported { range } => *range,
+            | Self::Exported { range } 
+            | Self::Type { range, .. } => *range,
         }
     }
 }
@@ -158,6 +180,8 @@ pub struct SemanticEventExtractor {
     bindings: FxHashMap<BindingName, BindingInfo>,
     /// Type parameters bound in a `infer T` clause.
     infers: Vec<TsTypeParameterName>,
+
+    known_types: FxHashMap<TextRange, SemanticEventType>,
 }
 
 /// A binding name is either a type or a value.
@@ -253,8 +277,18 @@ enum ScopeHoisting {
 }
 
 #[derive(Debug)]
+pub enum ScopeKind {
+    Other,
+    Function {
+        arguments: Vec<TextRange>,
+        returns: Vec<TextRange>
+    }
+}
+
+#[derive(Debug)]
 struct Scope {
     scope_id: usize,
+    kind: ScopeKind,
     /// All bindings declared inside this scope
     bindings: Vec<BindingName>,
     /// References that still needs to be bound and will be solved at the end of the scope
@@ -273,7 +307,31 @@ impl SemanticEventExtractor {
             scope_count: 0,
             bindings: FxHashMap::default(),
             infers: vec![],
+            known_types: FxHashMap::default(),
         }
+    }
+
+    fn get_current_function(&self) -> Option<usize> {
+        let len = self.scopes.len() - 1;
+        self.scopes.iter().rev().position(|scope| {
+            matches!(scope.kind, ScopeKind::Function { .. })
+        }).map(|x| len - x)
+    }
+
+    fn push_node_to_current_function_return(&mut self, node: &JsSyntaxNode) {
+        let current_function = self.get_current_function().unwrap();
+        let ScopeKind::Function { returns, .. } = &mut self.scopes[current_function].kind else {
+            todo!("{:?}",  &mut self.scopes[current_function].kind);
+        };
+        returns.push(node.text_range());
+    }
+
+    fn push_node_as_another_argument_for_current_function(&mut self, node: &JsSyntaxNode) {
+        let current_function = self.get_current_function().unwrap();
+        let ScopeKind::Function { arguments, .. } = &mut self.scopes[current_function].kind else {
+            todo!("{:?}",  &mut self.scopes[current_function].kind);
+        };
+        arguments.push(node.text_range());
     }
 
     /// See [SemanticEvent] for a more detailed description of which events [SyntaxNode] generates.
@@ -305,10 +363,9 @@ impl SemanticEventExtractor {
             | JS_METHOD_OBJECT_MEMBER
             | JS_GETTER_OBJECT_MEMBER
             | JS_SETTER_OBJECT_MEMBER => {
-                self.push_scope(
+                self.push_scope_function(
                     node.text_range(),
                     ScopeHoisting::DontHoistDeclarationsToParent,
-                    true,
                 );
             }
 
@@ -343,6 +400,18 @@ impl SemanticEventExtractor {
                     ScopeHoisting::HoistDeclarationsToParent,
                     false,
                 );
+            }
+
+            JS_RETURN_STATEMENT => {
+                let r = JsReturnStatement::cast_ref(node).unwrap();
+                self.push_node_to_current_function_return(r.argument().unwrap().syntax());
+            }
+            JS_NUMBER_LITERAL_EXPRESSION => {
+                self.known_types.insert(node.text_range(), SemanticEventType::Number);
+                self.stash.push_back(SemanticEvent::Type { 
+                    range: node.text_range(),
+                    t: SemanticEventType::Number
+                });
             }
 
             _ => {
@@ -504,6 +573,32 @@ impl SemanticEventExtractor {
             hoisted_scope_id,
             range: node.syntax().text_range(),
         });
+
+        // Type event for the binding
+        let parent = node.syntax().parent().unwrap();
+        let t = match node.syntax().parent().kind().unwrap() {
+            JS_FORMAL_PARAMETER => {
+                let parameter = JsFormalParameter::cast_ref(&parent).unwrap();
+
+                self.push_node_as_another_argument_for_current_function(&node.syntax());
+
+                if let Some(annotation) = parameter.type_annotation() {
+                    match annotation.ty().unwrap() {
+                        AnyTsType::TsNumberLiteralType(_) => SemanticEventType::Number,
+                        AnyTsType::TsNumberType(_) => SemanticEventType::Number,
+                        _ => SemanticEventType::Unknown,
+                    }
+                } else {
+                    SemanticEventType::Unknown
+                }
+            }
+            _ => SemanticEventType::Unknown,
+        };
+
+        if !matches!(t, SemanticEventType::Unknown) {
+            self.stash.push_back(SemanticEvent::Type { range: node.syntax().text_range(), t });
+        }
+         
         if is_exported {
             self.stash.push_back(SemanticEvent::Exported {
                 range: node.syntax().text_range(),
@@ -586,7 +681,7 @@ impl SemanticEventExtractor {
             | JS_FUNCTION_DECLARATION
             | JS_FUNCTION_EXPORT_DEFAULT_DECLARATION
             | JS_FUNCTION_EXPRESSION
-            | JS_ARROW_FUNCTION_EXPRESSION
+            
             | JS_CLASS_DECLARATION
             | JS_CLASS_EXPORT_DEFAULT_DECLARATION
             | JS_CLASS_EXPRESSION
@@ -618,6 +713,44 @@ impl SemanticEventExtractor {
             | TS_EXTERNAL_MODULE_DECLARATION => {
                 self.pop_scope(node.text_range());
             }
+
+            JS_ARROW_FUNCTION_EXPRESSION => {
+                let f = JsArrowFunctionExpression::cast_ref(node).unwrap();
+                match f.body().unwrap() {
+                    AnyJsFunctionBody::AnyJsExpression(expr) => {
+                        self.push_node_to_current_function_return(expr.syntax());
+                    },
+                    AnyJsFunctionBody::JsFunctionBody(_) => {},
+                }
+                self.pop_scope(node.text_range());
+            }
+
+            JS_PARENTHESIZED_EXPRESSION => {
+                let expr = node.clone().cast::<JsParenthesizedExpression>().unwrap();
+                let expr = expr.expression().unwrap();
+                dbg!(&self.known_types);
+                if let Some(t) = self.known_types.get(&expr.syntax().text_range()).cloned() {
+                    self.known_types.insert(node.text_range(), t.clone());
+                    self.stash.push_back(SemanticEvent::Type {
+                        range: node.text_range(),
+                        t,
+                    });
+                }
+            }
+            JS_BINARY_EXPRESSION => {
+                let expr = node.clone().cast::<JsBinaryExpression>().unwrap();
+                let l = expr.left().unwrap();
+                let r = expr.right().unwrap();
+
+                self.stash.push_back(SemanticEvent::Type {
+                    range: node.text_range(),
+                    t: SemanticEventType::Binary {
+                        left: l.syntax().text_range(),
+                        right: r.syntax().text_range(),
+                    },
+                });
+            }
+
             _ => {
                 if let Some(node) = AnyTsType::cast_ref(node) {
                     self.leave_any_type(&node);
@@ -685,6 +818,29 @@ impl SemanticEventExtractor {
             references: FxHashMap::default(),
             shadowed: vec![],
             hoisting,
+            kind: ScopeKind::Other,
+        });
+    }
+
+    fn push_scope_function(&mut self, range: TextRange, hoisting: ScopeHoisting) {
+        let scope_id = self.scope_count;
+        self.scope_count += 1;
+        self.stash.push_back(SemanticEvent::ScopeStarted {
+            range,
+            scope_id,
+            parent_scope_id: self.scopes.iter().last().map(|x| x.scope_id),
+            is_closure: true,
+        });
+        self.scopes.push(Scope {
+            scope_id,
+            bindings: vec![],
+            references: FxHashMap::default(),
+            shadowed: vec![],
+            hoisting,
+            kind: ScopeKind::Function {
+                arguments: vec![],
+                returns: vec![],
+            }
         });
     }
 
@@ -806,9 +962,22 @@ impl SemanticEventExtractor {
         self.bindings.extend(scope.shadowed);
 
         self.stash.push_back(SemanticEvent::ScopeEnded {
-            range,
+            range: range.clone(),
             scope_id: scope.scope_id,
         });
+
+        match scope.kind {
+            ScopeKind::Other => {},
+            ScopeKind::Function { arguments, returns } => {
+                self.stash.push_back(SemanticEvent::Type { 
+                    range, 
+                    t: SemanticEventType::Callable {
+                        arguments,
+                        returns
+                    }
+                })
+            },
+        }
     }
 
     fn dual_binding_info(&self, binding_name: BindingName) -> Option<&BindingInfo> {

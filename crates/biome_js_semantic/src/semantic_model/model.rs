@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+
+use crate::types::{HasTypeAstNode, SemanticTypeData, SemanticType};
+
 use super::*;
 use biome_js_syntax::{AnyJsFunction, AnyJsRoot, JsInitializerClause, JsVariableDeclarator};
 
@@ -51,6 +55,9 @@ pub(crate) struct SemanticModelData {
     pub(crate) unresolved_references: Vec<SemanticModelUnresolvedReference>,
     /// All globals references
     pub(crate) globals: Vec<SemanticModelGlobalBindingData>,
+
+    pub(crate) type_data: Vec<SemanticTypeData>,
+    pub(crate) type_by_range: HashMap<TextRange, usize>,
 }
 
 impl SemanticModelData {
@@ -214,6 +221,14 @@ impl SemanticModel {
         Some(Binding {
             data: self.data.clone(),
             index: id.into(),
+        })
+    }
+
+    pub fn ty(&self, expr: &impl HasTypeAstNode) -> Option<SemanticType> {
+        let idx = self.data.type_by_range.get(&expr.syntax().text_range())?;
+        Some(SemanticType {
+            data: self.data.clone(),
+            idx: *idx
         })
     }
 

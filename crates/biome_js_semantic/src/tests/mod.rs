@@ -5,6 +5,8 @@ mod infer;
 mod references;
 mod scopes;
 
+mod types;
+
 #[macro_export]
 macro_rules! assert_semantics {
     ($(#[$attr:meta])* $($name:ident, $code:expr,)*) => {

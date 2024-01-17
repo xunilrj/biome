@@ -7,6 +7,7 @@ mod is_constant;
 mod model;
 mod reference;
 mod scope;
+pub mod types;
 
 #[cfg(test)]
 mod tests;

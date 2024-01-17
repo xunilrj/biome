@@ -1,14 +1,14 @@
-use crate::{semantic_events, SemanticEvent};
+use crate::{semantic_events, SemanticEvent, semantic_model, SemanticModelOptions, SemanticModel};
 use biome_console::{markup, ConsoleExt, EnvConsole};
 use biome_diagnostics::location::AsSpan;
 use biome_diagnostics::{
     Advices, Diagnostic, DiagnosticExt, Location, LogCategory, PrintDiagnostic, Visit,
 };
 use biome_js_parser::JsParserOptions;
-use biome_js_syntax::{AnyJsRoot, JsFileSource, JsSyntaxToken, TextRange, TextSize, WalkEvent};
+use biome_js_syntax::{AnyJsRoot, JsFileSource, JsSyntaxToken, TextRange, TextSize, WalkEvent, JsSyntaxNode, JsNumberLiteralExpression, JsSyntaxKind, JsFunctionDeclaration};
 use biome_rowan::{AstNode, NodeOrToken};
 use rustc_hash::FxHashMap;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// This method helps testing scope resolution. It does this
 /// iterating [SemanticEventIterator] and storing where each scope start and end. Later it iterates
@@ -106,11 +106,11 @@ use std::collections::BTreeMap;
 /// if(true) ;/*NOEVENT*/;
 /// ```
 pub fn assert(code: &str, test_name: &str) {
-    let r = biome_js_parser::parse(code, JsFileSource::tsx(), JsParserOptions::default());
+    let root = biome_js_parser::parse(code, JsFileSource::tsx(), JsParserOptions::default());
 
-    if r.has_errors() {
+    if root.has_errors() {
         let mut console = EnvConsole::default();
-        for diag in r.into_diagnostics() {
+        for diag in root.into_diagnostics() {
             let error = diag
                 .with_file_path("example.js")
                 .with_file_source_code(code);
@@ -121,11 +121,13 @@ pub fn assert(code: &str, test_name: &str) {
         panic!("Compilation error");
     }
 
+    let model = semantic_model(&root.tree(), SemanticModelOptions::default());
+
     // Extract semantic events and index by range
 
     let mut events_by_pos: FxHashMap<TextSize, Vec<SemanticEvent>> = FxHashMap::default();
     let mut scope_start_by_id: FxHashMap<usize, TextSize> = FxHashMap::default();
-    for event in semantic_events(r.syntax()) {
+    for event in semantic_events(root.syntax()) {
         let pos = if let SemanticEvent::ScopeEnded {
             range, scope_id, ..
         } = event
@@ -139,11 +141,10 @@ pub fn assert(code: &str, test_name: &str) {
         v.push(event);
     }
 
-    let assertions = SemanticAssertions::from_root(r.tree(), code, test_name);
+    let assertions = SemanticAssertions::from_root(root.tree(), code, test_name);
 
     // check
-
-    assertions.check(code, test_name, events_by_pos, scope_start_by_id);
+    assertions.check(code, &root.tree(), &model, test_name, events_by_pos, scope_start_by_id);
 }
 
 #[derive(Debug, Diagnostic)]
@@ -242,6 +243,12 @@ struct UnresolvedReferenceAssertion {
 }
 
 #[derive(Clone, Debug)]
+struct TypeAssertion {
+    range: TextRange,
+    name: String
+}
+
+#[derive(Clone, Debug)]
 enum SemanticAssertion {
     Declaration(DeclarationAssertion),
     Read(ReadAssertion),
@@ -252,6 +259,7 @@ enum SemanticAssertion {
     NoEvent(NoEventAssertion),
     Unique(UniqueAssertion),
     UnresolvedReference(UnresolvedReferenceAssertion),
+    Type(TypeAssertion)
 }
 
 impl SemanticAssertion {
@@ -339,6 +347,20 @@ impl SemanticAssertion {
                     range: token.parent().unwrap().text_range(),
                 },
             ))
+        } else if assertion_text.contains("/*TYPE") {
+            let name = assertion_text
+                .trim()
+                .trim_start_matches("/*TYPE ")
+                .trim_end_matches("*/")
+                .trim()
+                .to_string();
+
+            Some(SemanticAssertion::Type(
+                TypeAssertion { 
+                    range: token.parent().unwrap().text_range(),
+                    name
+                }
+            ))
         } else {
             None
         }
@@ -356,6 +378,7 @@ struct SemanticAssertions {
     no_events: Vec<NoEventAssertion>,
     uniques: Vec<UniqueAssertion>,
     unresolved_references: Vec<UnresolvedReferenceAssertion>,
+    type_assertions: Vec<TypeAssertion>,
 }
 
 impl SemanticAssertions {
@@ -369,6 +392,7 @@ impl SemanticAssertions {
         let mut no_events = vec![];
         let mut uniques = vec![];
         let mut unresolved_references = vec![];
+        let mut type_assertions = vec![];
 
         for node in root
             .syntax()
@@ -423,6 +447,9 @@ impl SemanticAssertions {
                         Some(SemanticAssertion::UnresolvedReference(assertion)) => {
                             unresolved_references.push(assertion);
                         }
+                        Some(SemanticAssertion::Type(assertion)) => {
+                            type_assertions.push(assertion);
+                        }
                         None => {}
                     };
                 }
@@ -439,12 +466,15 @@ impl SemanticAssertions {
             no_events,
             uniques,
             unresolved_references,
+            type_assertions
         }
     }
 
     fn check(
         &self,
         code: &str,
+        root: &AnyJsRoot,
+        model: &SemanticModel,
         test_name: &str,
         events_by_pos: FxHashMap<TextSize, Vec<SemanticEvent>>,
         scope_start: FxHashMap<usize, TextSize>,
@@ -712,7 +742,6 @@ impl SemanticAssertions {
         }
 
         // Check every no event assertion
-
         for assertion in self.no_events.iter() {
             if events_by_pos.get(&assertion.range.start()).is_some() {
                 panic!("unexpected event at this position")
@@ -724,7 +753,6 @@ impl SemanticAssertions {
         }
 
         // Check every unique assertion
-
         for unique in self.uniques.iter() {
             if let Some(v) = events_by_pos.get(&unique.range.start()) {
                 if v.len() > 1 {
@@ -776,6 +804,30 @@ impl SemanticAssertions {
                 }
             }
         }
+
+        let range_to_node = root.syntax().descendants()
+            .map(|x| {
+                (x.text_range(), x)
+            }).collect::<HashMap<TextRange, JsSyntaxNode>>();
+
+        // Check each type_assertion is ok
+        for assertion in &self.type_assertions {
+            let node = &range_to_node[&assertion.range];
+            
+            let t = match node.kind() {
+                JsSyntaxKind::JS_NUMBER_LITERAL_EXPRESSION => model.ty(&JsNumberLiteralExpression::cast_ref(node).unwrap()),
+                JsSyntaxKind::JS_FUNCTION_DECLARATION => model.ty(&JsFunctionDeclaration::cast_ref(node).unwrap()),
+                x => todo!("{x:?} {:?}", assertion),
+            }.unwrap();
+
+            if assertion.name != t.notation() {
+                dbg!(&assertion);
+                dbg!(t.notation());
+                assert_eq!(assertion.name, t.notation());
+            }
+        }
+    
+    
     }
 }
 

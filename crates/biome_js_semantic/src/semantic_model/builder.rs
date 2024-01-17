@@ -1,7 +1,9 @@
+use crate::{semantic_model::types::{SemanticTypeData, KnownType}, SemanticEventType};
+
 use super::*;
 use biome_js_syntax::{AnyJsRoot, JsSyntaxNode, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::hash_map::Entry;
+use std::{collections::{hash_map::Entry, HashMap, HashSet}, ops::Deref};
 
 /// Builds the [SemanticModel] consuming [SemanticEvent] and [JsSyntaxNode].
 /// For a good example on how to use it see [semantic_model].
@@ -24,6 +26,209 @@ pub struct SemanticModelBuilder {
     declared_at_by_start: FxHashMap<TextSize, usize>,
     exported: FxHashSet<TextSize>,
     unresolved_references: Vec<SemanticModelUnresolvedReference>,
+    type_solver: SemanticTypeSolver
+}
+
+#[derive(Debug)]
+enum SemanticTypeSolverNode {
+    KnownType(TextRange, KnownType),
+    UnknownType(TextRange, SemanticEventType),
+}
+
+#[derive(Default)]
+struct SemanticTypeSolver {
+    nodes: HashMap<TextRange, SemanticTypeSolverNode>,
+    outwards_deps: HashMap<TextRange, Vec<TextRange>>,
+    inwards_deps: HashMap<TextRange, Vec<TextRange>>,
+}
+impl SemanticTypeSolver {
+    fn get_outwards_deps(t: &KnownType) -> Vec<TextRange> {
+        vec![]
+    }
+
+    fn push_known_type(&mut self, range: TextRange, t: KnownType) {
+        for to in Self::get_outwards_deps(&t) {
+            self.outwards_deps.entry(range.clone()).or_default().push(to.clone());
+            self.inwards_deps.entry(to).or_default().push(range.clone());
+        }
+
+        self.nodes.insert(range, SemanticTypeSolverNode::KnownType(range, t));
+    }
+
+    fn push_unknown_type(&mut self, range: TextRange, t: SemanticEventType) {
+        let outwards = match &t {
+            SemanticEventType::Void | SemanticEventType::Number | SemanticEventType::Unknown => vec![],
+            SemanticEventType::Reference { binding } => vec![binding.clone()],
+            SemanticEventType::Binary { left, right } => vec![left.clone(), right.clone()],
+            SemanticEventType::Callable { arguments, returns } => arguments.iter().chain(returns.iter()).cloned().collect(),
+        };
+
+        for to in outwards {
+            self.outwards_deps.entry(range.clone()).or_default().push(to.clone());
+            self.inwards_deps.entry(to.clone()).or_default().push(range.clone());
+        }
+
+        self.nodes.insert(range, SemanticTypeSolverNode::UnknownType(range, t));
+    }
+
+    fn get_known_type(&self, range: &TextRange) -> Option<&KnownType> {
+        let node = self.nodes.get(range)?;
+        match node {
+            SemanticTypeSolverNode::KnownType(_, t) => Some(t),
+            _ => None,
+        }
+    }
+
+    fn check_equal_and_return_first<'a>(&self, types: impl Iterator<Item = &'a KnownType>) -> Option<&'a KnownType> {
+        types.map(|x| Some(x)).reduce(|first, current| {
+            let first = first?;
+            let current = current?;
+            match (first, current) {
+                (KnownType::Void, KnownType::Void) => Some(first),
+                (KnownType::Number, KnownType::Number) => Some(first),
+                (KnownType::Callable { 
+                    arguments: l_arguments, 
+                    ret: l_ret
+                }, KnownType::Callable { 
+                    arguments: r_arguments, 
+                    ret: r_ret
+                }) => {
+                    assert!(l_arguments.is_empty());
+                    assert!(r_arguments.is_empty());
+                    self.check_equal_and_return_first([l_ret.deref(), r_ret.deref()].into_iter())
+                },
+                _ => None
+            }
+        })?
+    }
+
+    fn solve(mut self) -> (Vec<SemanticTypeData>, HashMap<TextRange, usize>) {
+        let mut ws: VecDeque<TextRange> = self.nodes.iter().filter_map(|(k,v)| {
+            match v {
+                SemanticTypeSolverNode::KnownType(_, _) => None,
+                SemanticTypeSolverNode::UnknownType(_, _) => Some(k.clone()),
+            }
+        }).collect();
+
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let len = ws.len();
+
+            for _ in 0..len {
+                let Some(current) = ws.pop_front() else {
+                    panic!("too many items were popped")
+                };
+
+                let node = &self.nodes[&current];
+                match node {
+                    SemanticTypeSolverNode::KnownType(..) => {
+                        unreachable!("solved node should not be in the working set")
+                    },
+                    SemanticTypeSolverNode::UnknownType(range, SemanticEventType::Callable { arguments, returns }) => {
+                        let Some(arguments) = arguments.iter()
+                            .map(|x| self.get_known_type(x).cloned())
+                            .collect::<Option<Vec<_>>>() else {
+                                ws.push_back(current);
+                                continue;
+                            };
+                        
+                        let return_type = if returns.is_empty() {
+                            &KnownType::Void
+                        } else {
+                            let Some(returns) = returns.iter()
+                                .map(|x| self.get_known_type(x))
+                                .collect::<Option<VecDeque<_>>>() else {
+                                    ws.push_back(current);
+                                    continue;
+                                };
+
+                            if let Some(t) = self.check_equal_and_return_first(returns.into_iter()) {
+                                t
+                            } else {
+                                ws.push_back(current);
+                                continue;
+                            }
+                        };
+
+                        let _ = self.nodes.insert(*range, SemanticTypeSolverNode::KnownType (
+                            range.clone(),
+                            KnownType::Callable { arguments, ret: Box::new(return_type.clone()) }
+                        ));
+                        changed = true
+                    },
+                    SemanticTypeSolverNode::UnknownType(range, SemanticEventType::Reference { binding }) => {
+                        let Some(t) = self.get_known_type(binding) else {
+                            ws.push_back(current);
+                            continue;
+                        };
+
+                        let _ = self.nodes.insert(*range, SemanticTypeSolverNode::KnownType ( range.clone(), t.clone()));
+                        changed = true
+                    }
+                    SemanticTypeSolverNode::UnknownType(range, SemanticEventType::Binary { left, right }) => {
+                        let left = self.get_known_type(left);
+                        let right = self.get_known_type(right);
+
+                        match (left, right) {
+                            (Some(KnownType::Number), Some(KnownType::Number)) => {
+                                let _ = self.nodes.insert(*range, SemanticTypeSolverNode::KnownType (
+                                    range.clone(),
+                                    KnownType::Number
+                                ));
+                                changed = true
+                            }
+                            _ => {
+                                ws.push_back(current);
+                                continue;
+                            }
+                        }
+                    }
+                    SemanticTypeSolverNode::UnknownType(_, SemanticEventType::Unknown) => {
+                        ws.push_back(current);
+                        continue;
+                    }
+                    x => todo!("{x:?}")
+                }
+            }
+        }
+
+        // Set unknown nodes as any
+        for (range, node) in self.nodes.iter_mut() {
+            match node {
+                SemanticTypeSolverNode::UnknownType(_, _) => {
+                    *node = SemanticTypeSolverNode::KnownType (
+                        range.clone(),
+                        KnownType::Any
+                    );
+                },
+                _ => {}
+            }
+        }
+
+        let mut types = vec![];
+        let mut by_value: HashMap<KnownType, usize> = HashMap::new();
+        let mut by_range: HashMap<TextRange, usize> = HashMap::new();
+
+        for (range, node) in self.nodes {
+            match node {
+                SemanticTypeSolverNode::KnownType(_, t) => {
+                    if let Some(idx) = by_value.get(&t) {
+                        by_range.insert(range, *idx);
+                    } else {
+                        let idx = types.len();
+                        by_value.insert(t.clone(), idx);
+                        by_range.insert(range, idx);
+
+                        types.push(SemanticTypeData { t });
+                    }
+                },
+                SemanticTypeSolverNode::UnknownType(_, _) => {unreachable!("should not see unknown node.")},
+            }
+        }
+
+        (types, by_range)
+    }
 }
 
 impl SemanticModelBuilder {
@@ -41,6 +246,7 @@ impl SemanticModelBuilder {
             declared_at_by_start: FxHashMap::default(),
             exported: FxHashSet::default(),
             unresolved_references: Vec::new(),
+            type_solver: SemanticTypeSolver::default(),
         }
     }
 
@@ -86,6 +292,12 @@ impl SemanticModelBuilder {
             | JS_FOR_IN_STATEMENT
             | JS_SWITCH_STATEMENT
             | JS_CATCH_CLAUSE => {
+                self.node_by_range.insert(node.text_range(), node.clone());
+            }
+
+            // Accessible from Type Inference/Check
+            JS_NUMBER_LITERAL_EXPRESSION 
+            | JS_BINARY_EXPRESSION => {
                 self.node_by_range.insert(node.text_range(), node.clone());
             }
             _ => {}
@@ -206,6 +418,10 @@ impl SemanticModelBuilder {
                 });
 
                 self.declared_at_by_start.insert(range.start(), binding_id);
+
+                self.type_solver.push_unknown_type(range.clone(), SemanticEventType::Reference {
+                    binding: declaration_at
+                });
             }
             HoistedRead {
                 range,
@@ -229,6 +445,10 @@ impl SemanticModelBuilder {
                 });
 
                 self.declared_at_by_start.insert(range.start(), binding_id);
+
+                self.type_solver.push_unknown_type(range.clone(), SemanticEventType::Reference {
+                    binding: declaration_at
+                });
             }
             Write {
                 range,
@@ -252,6 +472,10 @@ impl SemanticModelBuilder {
                 });
 
                 self.declared_at_by_start.insert(range.start(), binding_id);
+
+                self.type_solver.push_unknown_type(range.clone(), SemanticEventType::Reference {
+                    binding: declaration_at
+                });
             }
             HoistedWrite {
                 range,
@@ -275,6 +499,10 @@ impl SemanticModelBuilder {
                 });
 
                 self.declared_at_by_start.insert(range.start(), binding_id);
+
+                self.type_solver.push_unknown_type(range.clone(), SemanticEventType::Reference {
+                    binding: declaration_at
+                });
             }
             UnresolvedReference { is_read, range } => {
                 let ty = if is_read {
@@ -315,11 +543,25 @@ impl SemanticModelBuilder {
             Exported { range } => {
                 self.exported.insert(range.start());
             }
+            Type { range, t } => {
+                let node = &self.node_by_range[&range];
+                match t {
+                    SemanticEventType::Void => todo!(),
+                    SemanticEventType::Number => {
+                        self.type_solver.push_known_type(node.text_range(), KnownType::Number);
+                    },
+                    e => {
+                        self.type_solver.push_unknown_type(node.text_range(), e);
+                    }
+                };
+            }
         }
     }
 
     #[inline]
     pub fn build(self) -> SemanticModel {
+        let (type_data, type_by_range) = self.type_solver.solve();
+
         let data = SemanticModelData {
             root: self.root,
             scopes: self.scopes,
@@ -338,6 +580,8 @@ impl SemanticModelBuilder {
             exported: self.exported,
             unresolved_references: self.unresolved_references,
             globals: self.globals,
+            type_data,
+            type_by_range,
         };
         SemanticModel::new(data)
     }
